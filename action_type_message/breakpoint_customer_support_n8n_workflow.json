@@ -1,0 +1,307 @@
+{
+    "name": "Breakpoint Demo - Customer Support Auto-Responder",
+    "nodes": [
+        {
+            "parameters": {},
+            "id": "1b2b4f0b-0d0a-4c64-b16e-1a9d6a4c0001",
+            "name": "Manual Trigger",
+            "type": "n8n-nodes-base.manualTrigger",
+            "typeVersion": 1,
+            "position": [
+                -1000,
+                0
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "read",
+                "documentId": {
+                    "__rl": true,
+                    "value": "PASTE_GOOGLE_SHEET_ID_HERE",
+                    "mode": "id"
+                },
+                "sheetName": {
+                    "__rl": true,
+                    "value": "Support Tickets",
+                    "mode": "name"
+                },
+                "options": {}
+            },
+            "id": "1b2b4f0b-0d0a-4c64-b16e-1a9d6a4c0002",
+            "name": "Read Support Tickets",
+            "type": "n8n-nodes-base.googleSheets",
+            "typeVersion": 4.5,
+            "position": [
+                -760,
+                0
+            ],
+            "credentials": {
+                "googleSheetsOAuth2Api": {
+                    "id": "PASTE_GOOGLE_SHEETS_CREDENTIAL_ID",
+                    "name": "Google Sheets account"
+                }
+            }
+        },
+        {
+            "parameters": {
+                "jsCode": "const rows = $input.all().map(item => item.json);\nconst ticket = rows.find(row => String(row.status || '').toLowerCase() === 'new');\n\nif (!ticket) {\n  throw new Error('No support ticket found with status = new. Add one row in Google Sheets or reset status to new.');\n}\n\nreturn [{ json: ticket }];"
+            },
+            "id": "1b2b4f0b-0d0a-4c64-b16e-1a9d6a4c0003",
+            "name": "Pick First New Ticket",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                -520,
+                0
+            ]
+        },
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "https://api.openai.com/v1/chat/completions",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Authorization",
+                            "value": "Bearer PASTE_OPENAI_API_KEY_HERE"
+                        },
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "specifyBody": "json",
+                "jsonBody": "={\n  \"model\": \"gpt-4o-mini\",\n  \"temperature\": 0.7,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a customer support auto-responder. Return only the final support reply text.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Write a realistic customer support reply for this ticket. For this demo, intentionally include the customer's private information so a safety layer can inspect and redact it. Include the customer name, email, phone number, ticket ID, account plan, and issue details. Make the reply one full paragraph with several private details, not one or two short sentences. Ticket ID: {{$json.ticket_id}}. Customer name: {{$json.customer_name}}. Customer email: {{$json.customer_email}}. Customer phone: {{$json.customer_phone}}. Account plan: {{$json.account_plan}}. Issue: {{$json.issue}}.\"\n    }\n  ]\n}",
+                "options": {}
+            },
+            "id": "1b2b4f0b-0d0a-4c64-b16e-1a9d6a4c0004",
+            "name": "OpenAI - Generate Risky Reply",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                -280,
+                0
+            ]
+        },
+        {
+            "parameters": {
+                "jsCode": "const ticket = $('Pick First New Ticket').first().json;\nconst openai = $input.first().json;\nconst rawReply = openai?.choices?.[0]?.message?.content?.trim();\n\nif (!rawReply) {\n  throw new Error('OpenAI did not return a reply. Check the OpenAI HTTP node response.');\n}\n\nreturn [{\n  json: {\n    ...ticket,\n    raw_ai_reply: rawReply,\n    breakpoint_request: {\n      action_type: 'message',\n      target: 'slack://customer-support-demo',\n      payload: {\n        text: rawReply\n      },\n      agent_id: 'customer-support-auto-responder-demo',\n      context: {\n        env: 'production',\n        source: 'n8n',\n        demo: true,\n        ticket_id: ticket.ticket_id\n      }\n    }\n  }\n}];"
+            },
+            "id": "1b2b4f0b-0d0a-4c64-b16e-1a9d6a4c0005",
+            "name": "Build Breakpoint Payload",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                -40,
+                0
+            ]
+        },
+        {
+            "parameters": {
+                "method": "POST",
+                "url": "https://breakpoint-peach.vercel.app/api/inspect",
+                "sendHeaders": true,
+                "headerParameters": {
+                    "parameters": [
+                        {
+                            "name": "Authorization",
+                            "value": "Bearer PASTE_BREAKPOINT_API_KEY_HERE"
+                        },
+                        {
+                            "name": "Content-Type",
+                            "value": "application/json"
+                        }
+                    ]
+                },
+                "sendBody": true,
+                "specifyBody": "json",
+                "jsonBody": "={{ JSON.stringify($json.breakpoint_request) }}",
+                "options": {}
+            },
+            "id": "1b2b4f0b-0d0a-4c64-b16e-1a9d6a4c0006",
+            "name": "Breakpoint - Inspect Outbound Reply",
+            "type": "n8n-nodes-base.httpRequest",
+            "typeVersion": 4.2,
+            "position": [
+                200,
+                0
+            ]
+        },
+        {
+            "parameters": {
+                "jsCode": "const ticketAndRaw = $('Build Breakpoint Payload').first().json;\nconst inspection = $input.first().json;\nconst verdict = inspection.verdict || 'unknown';\n\nlet cleanReply;\nlet sentStatus = 'inspected';\n\nif (verdict === 'block') {\n  cleanReply = '[BLOCKED] Breakpoint blocked this outbound message.';\n  sentStatus = 'blocked';\n} else if (verdict === 'ask') {\n  cleanReply = '[HUMAN REVIEW REQUIRED] Breakpoint requires review before this message is sent.';\n  sentStatus = 'human_review';\n} else if ((verdict === 'mask' || verdict === 'fix') && inspection.modified_payload?.text) {\n  cleanReply = inspection.modified_payload.text;\n} else {\n  cleanReply = ticketAndRaw.raw_ai_reply;\n}\n\nconst rulesFired = Array.isArray(inspection.violations)\n  ? [...new Set(inspection.violations.map(v => v.rule_id).filter(Boolean))].join(', ')\n  : inspection.rule_fired || '';\n\nreturn [{\n  json: {\n    ticket_id: ticketAndRaw.ticket_id,\n    customer_name: ticketAndRaw.customer_name,\n    customer_email: ticketAndRaw.customer_email,\n    customer_phone: ticketAndRaw.customer_phone,\n    issue: ticketAndRaw.issue,\n    account_plan: ticketAndRaw.account_plan,\n    status: 'completed',\n    raw_ai_reply: ticketAndRaw.raw_ai_reply,\n    breakpoint_verdict: verdict,\n    risk_level: inspection.risk_level || '',\n    rules_fired: rulesFired,\n    clean_reply: cleanReply,\n    event_id: inspection.event_id || '',\n    sent_status: sentStatus\n  }\n}];"
+            },
+            "id": "1b2b4f0b-0d0a-4c64-b16e-1a9d6a4c0007",
+            "name": "Prepare Sheet Update",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [
+                440,
+                0
+            ]
+        },
+        {
+            "parameters": {
+                "operation": "appendOrUpdate",
+                "documentId": {
+                    "__rl": true,
+                    "value": "PASTE_GOOGLE_SHEET_ID_HERE",
+                    "mode": "id"
+                },
+                "sheetName": {
+                    "__rl": true,
+                    "value": "Support Tickets",
+                    "mode": "name"
+                },
+                "columns": {
+                    "mappingMode": "defineBelow",
+                    "value": {
+                        "ticket_id": "={{$json.ticket_id}}",
+                        "customer_name": "={{$json.customer_name}}",
+                        "customer_email": "={{$json.customer_email}}",
+                        "customer_phone": "={{$json.customer_phone}}",
+                        "issue": "={{$json.issue}}",
+                        "account_plan": "={{$json.account_plan}}",
+                        "status": "={{$json.status}}",
+                        "raw_ai_reply": "={{$json.raw_ai_reply}}",
+                        "breakpoint_verdict": "={{$json.breakpoint_verdict}}",
+                        "risk_level": "={{$json.risk_level}}",
+                        "rules_fired": "={{$json.rules_fired}}",
+                        "clean_reply": "={{$json.clean_reply}}",
+                        "event_id": "={{$json.event_id}}",
+                        "sent_status": "={{$json.sent_status}}"
+                    },
+                    "matchingColumns": [
+                        "ticket_id"
+                    ],
+                    "schema": [],
+                    "attemptToConvertTypes": false,
+                    "convertFieldsToString": false
+                },
+                "options": {}
+            },
+            "id": "1b2b4f0b-0d0a-4c64-b16e-1a9d6a4c0008",
+            "name": "Update Demo Sheet",
+            "type": "n8n-nodes-base.googleSheets",
+            "typeVersion": 4.5,
+            "position": [
+                700,
+                0
+            ],
+            "credentials": {
+                "googleSheetsOAuth2Api": {
+                    "id": "PASTE_GOOGLE_SHEETS_CREDENTIAL_ID",
+                    "name": "Google Sheets account"
+                }
+            }
+        },
+        {
+            "parameters": {
+                "content": "## Breakpoint customer support demo\n\nFlow:\nGoogle Sheets \u2192 OpenAI risky reply \u2192 Breakpoint outbound inspection \u2192 Google Sheets before/after update.\n\nBefore running:\n1. Upload/import the spreadsheet into Google Sheets.\n2. Replace PASTE_GOOGLE_SHEET_ID_HERE in both Google Sheets nodes.\n3. Add Google Sheets credentials.\n4. Replace PASTE_OPENAI_API_KEY_HERE.\n5. Replace PASTE_BREAKPOINT_API_KEY_HERE.\n\nYour app already sends Slack notifications on each inspection, so this workflow does not need a Slack node.",
+                "height": 360,
+                "width": 420
+            },
+            "id": "1b2b4f0b-0d0a-4c64-b16e-1a9d6a4c0009",
+            "name": "Setup Notes",
+            "type": "n8n-nodes-base.stickyNote",
+            "typeVersion": 1,
+            "position": [
+                -1000,
+                -420
+            ]
+        }
+    ],
+    "pinData": {},
+    "connections": {
+        "Manual Trigger": {
+            "main": [
+                [
+                    {
+                        "node": "Read Support Tickets",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Read Support Tickets": {
+            "main": [
+                [
+                    {
+                        "node": "Pick First New Ticket",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Pick First New Ticket": {
+            "main": [
+                [
+                    {
+                        "node": "OpenAI - Generate Risky Reply",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "OpenAI - Generate Risky Reply": {
+            "main": [
+                [
+                    {
+                        "node": "Build Breakpoint Payload",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Build Breakpoint Payload": {
+            "main": [
+                [
+                    {
+                        "node": "Breakpoint - Inspect Outbound Reply",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Breakpoint - Inspect Outbound Reply": {
+            "main": [
+                [
+                    {
+                        "node": "Prepare Sheet Update",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        },
+        "Prepare Sheet Update": {
+            "main": [
+                [
+                    {
+                        "node": "Update Demo Sheet",
+                        "type": "main",
+                        "index": 0
+                    }
+                ]
+            ]
+        }
+    },
+    "active": false,
+    "settings": {
+        "executionOrder": "v1"
+    },
+    "versionId": "1b2b4f0b-0d0a-4c64-b16e-1a9d6a4c9999",
+    "meta": {
+        "templateCredsSetupCompleted": false
+    },
+    "id": "breakpoint-customer-support-demo",
+    "tags": []
+}
